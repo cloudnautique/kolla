@@ -2,14 +2,16 @@
 
 set -e
 
+mkdir -p /opt/kolla
 mkdir -p /etc/kolla
+mkdir -p /host/opt/kolla
 mkdir -p /host/etc/kolla
 
 ROLE=${1:-"compute"}
 TIMEZONE=${HOST_TIMEZONE:-"America/Phoenix"}
 
 write_kolla_globals() {
-cat>/host/etc/kolla/globals.yml<<EOF
+cat>/host/opt/kolla/globals.yml<<EOF
 kolla_base_distro: "centos"
 kolla_install_type: "binary"
 openstack_release: "2.0.1"
@@ -45,15 +47,17 @@ remove_lock()
 
 configure_globals()
 {
-    if [ ! -e /host/etc/kolla/globals.yml ]; then
+    if [ ! -e /host/opt/kolla/globals.yml ]; then
         echo "Writing new globals.yml"
         write_kolla_globals
-        if [ -e /host/etc/kolla/password.yml ]; then
-            rm /host/etc/kolla/password.yml
+        if [ -e /host/opt/kolla/password.yml ]; then
+            rm /host/opt/kolla/password.yml
         fi
     fi
 }
 
+# Oh Rancher OS 
+mount --bind /host/opt/kolla /opt/kolla
 mount --bind /host/etc/kolla /etc/kolla
 mount --bind /host/run /run
 
@@ -64,13 +68,19 @@ fi
 
 configure_passwords()
 {
-    if [ ! -e /host/etc/kolla/passwords.yml ]; then
+    if [ ! -e /host/opt/kolla/passwords.yml ]; then
         echo "Generating new passwords"
-        cp /usr/local/share/kolla/etc_examples/kolla/passwords.yml /host/etc/kolla/
+        cp /usr/local/share/kolla/etc_examples/kolla/passwords.yml /etc/kolla/
         kolla-genpwd
+        cp /etc/kolla/passwords.yml /host/opt/kolla/
         if [ -n "${OPENSTACK_ADMIN_PASSWORD}" ]; then
-            sed -i "s/\(keystone_admin_password:\) \([a-zA-Z0-9].*\)/\1 ${OPENSTACK_ADMIN_PASSWORD}/" /host/etc/kolla/passwords.yml
+            sed -i "s/\(keystone_admin_password:\) \([a-zA-Z0-9].*\)/\1 ${OPENSTACK_ADMIN_PASSWORD}/" /host/opt/kolla/passwords.yml
         fi
+    fi
+
+    # opt should have this file now, so put it in etc. This is a ROS workaround
+    if [ ! -e /host/etc/kolla/passwords.yml ]; then
+        cp /host/opt/kolla/passwords.yml /host/etc/kolla/passwords.yml
     fi
 }
 
@@ -92,11 +102,14 @@ run_kolla()
     ## Disable SSH ARGS because some OSes do not support the ControlPersist/ControlMaster args.
     export ANSIBLE_SSH_ARGS=
     export ANSIBLE_HOST_KEY_CHECKING=False
-    kolla-ansible deploy -i /usr/local/share/kolla/ansible/inventory/rancher-inventory
+    kolla-ansible deploy --configdir /opt/kolla -i /usr/local/share/kolla/ansible/inventory/rancher-inventory
 
-    kolla-ansible post-deploy -i /usr/local/share/kolla/ansible/inventory/rancher-inventory
-    . /etc/kolla/admin-openrc.sh
-    /usr/local/share/kolla/init-runonce
+    kolla-ansible post-deploy --configdir /opt/kolla -i /usr/local/share/kolla/ansible/inventory/rancher-inventory
+    if [ -e /etc/kolla/admin-openrc.sh ]; then
+        . /etc/kolla/admin-openrc.sh
+        /usr/local/share/kolla/init-runonce
+    fi
+
     remove_lock
 }
 
@@ -128,9 +141,9 @@ run_sshd()
 if [ "${ROLE}" = "controller" ]; then
     while true; do
         if [ -e "/usr/local/share/kolla/ansible/kolla-refresh" ]; then
-            rm -f /usr/local/share/kolla/ansible/kolla-refresh
             get_lock
             trap remove_lock EXIT TERM 
+            rm -f /usr/local/share/kolla/ansible/kolla-refresh
             configure_globals
             configure_passwords
             setup_hostfile
